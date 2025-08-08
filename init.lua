@@ -164,84 +164,57 @@ mineysocket.receive = function()
         mineysocket.receive()
         return
       else
-        -- get data from buffer and reset em
-        if mineysocket["socket_clients"][clientid]["buffer"] then
-          data = mineysocket["socket_clients"][clientid].buffer .. data
-          mineysocket["socket_clients"][clientid].buffer = nil
-        end
-
-        mineysocket.log("action", "Received: \n" .. data)
-
-        -- we try to find the eom message terminator for this session
-        if mineysocket["socket_clients"][clientid].eom == nil then
-          if string.sub(data, -2) == "\r\n" then
-            mineysocket["socket_clients"][clientid].eom = "\r\n"
-          else
-            mineysocket["socket_clients"][clientid].eom = "\n"
-          end
-        end
-
-        -- simple alive check
-        if data == "ping" .. mineysocket["socket_clients"][clientid].eom then
-          mineysocket["socket_clients"][clientid].socket:send("pong" .. mineysocket["socket_clients"][clientid].eom)
-          return
-        end
-
-        -- parse data as json
-        local status, input = pcall(mineysocket.json.decode, data)
-        if not status then
-          minetest.log("error", "mineysocket: " .. mineysocket.json.encode({ error = input }))
-          mineysocket.log("error", "JSON-Error: " .. input, ip, port)
-          mineysocket.send(clientid, mineysocket.json.encode({ error = "JSON decode error - " .. input }))
-          return
-        end
-
-        -- is it a known client, or do we need authentication?
-        if mineysocket["socket_clients"][clientid].auth == true then
-          ----------------------------
-          -- commands:
-          ----------------------------
-
-          -- we run lua code
-          if input["lua"] then
-            result = run_lua(input, clientid, ip, port)
-          end
-
-          -- append event to callback list
-          if input["register_event"] then
-            result = mineysocket.register_event(clientid, input["register_event"])
-          end
-
-          -- append event to callback list
-          if input["unregister_event"] then
-            result = mineysocket.unregister_event(clientid, input["unregister_event"])
-          end
-
-          -- handle reauthentication
-          if input["playername"] and input["password"] then
-            result = mineysocket.authenticate(input, clientid, ip, port, mineysocket["socket_clients"][clientid].socket)
-          end
-
-          -- reattach id
-          if input["id"] and result ~= false then
-            result["id"] = input["id"]
-          end
-
-          -- send result
-          if result ~= false then
-            mineysocket.send(clientid, mineysocket.json.encode(result))
-          else
-            mineysocket.send(clientid, mineysocket.json.encode({ error = "Unknown command" }))
-          end
-
+        -- append to buffer
+        if not mineysocket["socket_clients"][clientid].buffer then
+          mineysocket["socket_clients"][clientid].buffer = data
         else
-          -- we need authentication
-          if input["playername"] and input["password"] then
-            mineysocket.send(clientid, mineysocket.json.encode(mineysocket.authenticate(input, clientid, ip, port, mineysocket["socket_clients"][clientid].socket)))
-          else
-            mineysocket.send(clientid, mineysocket.json.encode({ error = "Unknown command" }))
+          mineysocket["socket_clients"][clientid].buffer = mineysocket["socket_clients"][clientid].buffer .. data
+        end
+
+        -- for unauthenticated clients, limit buffer size if we still don't have a newline yet
+        if mineysocket["socket_clients"][clientid].auth == false then
+          local buf = mineysocket["socket_clients"][clientid].buffer or ""
+          if not string.find(buf, "\n", 1, true) and string.len(buf) > 10 then
+            mineysocket["socket_clients"][clientid].buffer = nil
+            return
           end
         end
+
+        -- process all complete commands in the buffer, line by line
+        local buf = mineysocket["socket_clients"][clientid].buffer or ""
+        while true do
+          local nl_pos = string.find(buf, "\n", 1, true)
+          if not nl_pos then
+            break
+          end
+
+          -- detect and set EOM if needed based on first seen newline (\n or \r\n)
+          local used_eom = "\n"
+          local line_end = nl_pos - 1
+          if nl_pos > 1 and string.sub(buf, nl_pos - 1, nl_pos - 1) == "\r" then
+            used_eom = "\r\n"
+            line_end = nl_pos - 2
+          end
+          if mineysocket["socket_clients"][clientid].eom == nil then
+            mineysocket["socket_clients"][clientid].eom = used_eom
+          end
+
+          local line = ""
+          if line_end >= 1 then
+            line = string.sub(buf, 1, line_end)
+          end
+
+          -- log and process a single command line (without EOM)
+          if line ~= "" then
+            mineysocket.log("action", "Received: \n" .. line)
+          end
+          mineysocket.process_command(line, clientid)
+
+          -- remove processed line (including newline) from buffer and continue
+          buf = string.sub(buf, nl_pos + 1)
+        end
+        -- keep remainder (incomplete line) in buffer
+        mineysocket["socket_clients"][clientid].buffer = buf
       end
     end
   end
@@ -297,6 +270,75 @@ function run_lua(input, clientid, ip, port)
 end
 
 
+-- process a single command line (without trailing newline)
+mineysocket.process_command = function(line, clientid)
+  -- detect peer info for logging and auth decisions
+  local ip, port = nil, nil
+  if mineysocket["socket_clients"][clientid] and mineysocket["socket_clients"][clientid].socket then
+    ip, port = mineysocket["socket_clients"][clientid].socket:getpeername()
+  end
+
+  -- simple alive check
+  if line == "ping" then
+    mineysocket["socket_clients"][clientid].socket:send("pong" .. (mineysocket["socket_clients"][clientid].eom or "\n"))
+    return
+  end
+
+  if not line or line == "" then
+    return
+  end
+
+  -- parse data as json
+  local status, input = pcall(mineysocket.json.decode, line)
+  if not status then
+    local err = input
+    minetest.log("error", "mineysocket: " .. mineysocket.json.encode({ error = err }))
+    mineysocket.log("error", "JSON-Error: " .. tostring(err), ip, port)
+    mineysocket.send(clientid, mineysocket.json.encode({ error = "JSON decode error - " .. tostring(err) }))
+    return
+  end
+
+  local result = false
+  -- is it a known client, or do we need authentication?
+  if mineysocket["socket_clients"][clientid].auth == true then
+    -- commands:
+    if input["lua"] then
+      result = run_lua(input, clientid, ip, port)
+    end
+
+    if input["register_event"] then
+      result = mineysocket.register_event(clientid, input["register_event"])
+    end
+
+    if input["unregister_event"] then
+      result = mineysocket.unregister_event(clientid, input["unregister_event"])
+    end
+
+    if input["playername"] and input["password"] then
+      result = mineysocket.authenticate(input, clientid, ip, port, mineysocket["socket_clients"][clientid].socket)
+    end
+
+    if input["id"] and result ~= false then
+      result["id"] = input["id"]
+    end
+
+    if result ~= false then
+      mineysocket.send(clientid, mineysocket.json.encode(result))
+    else
+      mineysocket.send(clientid, mineysocket.json.encode({ error = "Unknown command" }))
+    end
+
+  else
+    -- we need authentication
+    if input["playername"] and input["password"] then
+      mineysocket.send(clientid, mineysocket.json.encode(mineysocket.authenticate(input, clientid, ip, port, mineysocket["socket_clients"][clientid].socket)))
+    else
+      mineysocket.send(clientid, mineysocket.json.encode({ error = "Unknown command" }))
+    end
+  end
+end
+
+
 -- authenticate clients
 mineysocket.authenticate = function(input, clientid, ip, port, socket)
     local player = minetest.get_auth_handler().get_auth(input["playername"])
@@ -317,7 +359,7 @@ mineysocket.authenticate = function(input, clientid, ip, port, socket)
       else
         mineysocket.log("error", "Wrong playername ('" .. input["playername"] .. "') or password", ip, port)
         mineysocket["socket_clients"][clientid].auth = false
-        return { error = "authentication error" }
+        return { error = "authentication error", id = "auth" }
       end
     end
 end
