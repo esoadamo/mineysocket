@@ -70,7 +70,7 @@ The TCP port mineysocket is listening.
 
 ## Notes
 
-Clients can only run code after authentication and if the user has "server" privilege (or if connected from 127.0.0.1).
+Clients can only run code after authentication and if the user has "mineysocket" privilege (or if connected from 127.0.0.1).
 
 This may change, but currently authenticated users can do anything in the minetest api, also change their own and other users privileges!
 

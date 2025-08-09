@@ -346,7 +346,7 @@ end
 mineysocket.authenticate = function(input, clientid, ip, port, socket)
     local player = minetest.get_auth_handler().get_auth(input["playername"])
 
-    if ip == "127.0.0.1" or (player and minetest.check_password_entry(input["playername"], player['password'], input["password"]) and minetest.check_player_privs(input["playername"], { server = true })) then
+    if ip == "127.0.0.1" or (player and minetest.check_password_entry(input["playername"], player['password'], input["password"]) and minetest.check_player_privs(input["playername"], { mineysocket = true })) then
       mineysocket.log("action", "Player '" .. input["playername"] .. "' authentication successful", clientid)
       mineysocket["socket_clients"][clientid].auth = true
       mineysocket["socket_clients"][clientid].playername = input["playername"]
@@ -464,7 +464,7 @@ mineysocket.register_chatcommand = function(clientid, definition)
       privs = privs,
       func = function(name, param)
         mineysocket.send_event({ event = { "chatcommand_" .. cmd, name, param } })
-        return true, "Command received"
+        return true, ""
       end
     })
     mineysocket.log("action", "Registered new chatcommand '/" .. cmd .. "' via client " .. clientid, clientid)
