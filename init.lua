@@ -21,17 +21,21 @@ mineysocket = {}  -- global namespace
 -- configuration
 mineysocket.host_ip = minetest.settings:get("mineysocket.host_ip")
 mineysocket.host_port = minetest.settings:get("mineysocket.host_port")
+mineysocket.debug = minetest.settings:get("mineysocket.debug")
+mineysocket.max_clients = minetest.settings:get("mineysocket.max_clients")
 
--- Workaround for bug, where default values return only nil
 if not mineysocket.host_ip then
   mineysocket.host_ip = "127.0.0.1"
 end
 if not mineysocket.host_port then
   mineysocket.host_port = 29999
 end
-
-mineysocket.debug = true  -- set to true to show all log levels
-mineysocket.max_clients = 1000
+if not mineysocket.debug then
+  mineysocket.debug = false
+end
+if not mineysocket.max_clients then
+  mineysocket.max_clients = 10
+end
 
 -- Global variables
 mineysocket.chatcommands = {}
@@ -115,18 +119,13 @@ mineysocket.receive = function()
       mineysocket["socket_clients"][clientid].last_message = minetest.get_server_uptime()
       mineysocket["socket_clients"][clientid].buffer = ""
       mineysocket["socket_clients"][clientid].eom = nil
-
-      if ip == "127.0.0.1" then  -- skip authentication for 127.0.0.1
-        mineysocket["socket_clients"][clientid].auth = true
-        mineysocket["socket_clients"][clientid].playername = "localhost"
-        mineysocket["socket_clients"][clientid].events = {}
-      else
-        mineysocket["socket_clients"][clientid].auth = false
-      end
+      mineysocket["socket_clients"][clientid].ip = ip
+      mineysocket["socket_clients"][clientid].port = port
+      mineysocket["socket_clients"][clientid].auth = false
     end
   else
     if err ~= "timeout" then
-      mineysocket.log("error", "Connection error \"" .. err .. "\"")
+      mineysocket.log("error", "Connection error \"" .. err .. "\"", clientid)
       client:close()
     end
   end
@@ -148,10 +147,10 @@ mineysocket.receive = function()
           end
         end
         mineysocket["socket_clients"][clientid] = nil
-        mineysocket.log("action", "Connection to ".. clientid .." was closed")
+        mineysocket.log("action", "Connection to ".. clientid .." was closed", clientid)
         return
       else
-        mineysocket.log("action", err)
+        mineysocket.log("action", err, clientid)
       end
     end
     if data and data ~= "" then
@@ -215,7 +214,7 @@ mineysocket.receive = function()
 
           -- log and process a single command line (without EOM)
           if line ~= "" then
-            mineysocket.log("action", "Received: \n" .. line)
+            mineysocket.log("action", "< " .. line, clientid)
           end
           mineysocket.process_command(line, clientid)
 
@@ -237,12 +236,7 @@ function run_lua(input, clientid, ip, port)
 
   start_time = minetest.get_server_uptime()
 
-  -- log the (shortend) code
-  if string.len(input["lua"]) > 120 then
-    mineysocket.log("action", "execute: " .. string.sub(input["lua"], 0, 120) .. " ...", ip, port)
-  else
-    mineysocket.log("action", "execute: " .. input["lua"], ip, port)
-  end
+  mineysocket.log("action", "$ " .. input["lua"], clientid)
 
   -- run
   local f, syntaxError = loadstring(input["lua"])
@@ -256,11 +250,7 @@ function run_lua(input, clientid, ip, port)
       output["result"] = { result1, result2, result3, result4, result5 }
       if mineysocket.debug then
         local json_output = mineysocket.json.encode(output)
-        if string.len(json_output) > 120 then
-          mineysocket.log("action", string.sub(json_output, 0, 120) .. " ..." .. " in " .. (minetest.get_server_uptime() - start_time) .. " seconds", ip, port)
-        else
-          mineysocket.log("action", json_output .. " in " .. (minetest.get_server_uptime() - start_time) .. " seconds", ip, port)
-        end
+        mineysocket.log("action", "# " .. json_output .. " in " .. (minetest.get_server_uptime() - start_time) .. " seconds", clientid)
       end
       return output
     else
@@ -273,7 +263,7 @@ function run_lua(input, clientid, ip, port)
   -- send lua errors
   if err then
     output["error"] = err
-    mineysocket.log("error", "Error " .. err .. " in command", ip, port)
+    mineysocket.log("error", "Error " .. err .. " in command", clientid)
     return output
   end
 end
@@ -302,7 +292,7 @@ mineysocket.process_command = function(line, clientid)
   if not status then
     local err = input
     minetest.log("error", "mineysocket: " .. mineysocket.json.encode({ error = err }))
-    mineysocket.log("error", "JSON-Error: " .. tostring(err), ip, port)
+    mineysocket.log("error", "JSON-Error: " .. tostring(err), clientid)
     mineysocket.send(clientid, mineysocket.json.encode({ error = "JSON decode error - " .. tostring(err) }))
     return
   end
@@ -356,24 +346,16 @@ end
 mineysocket.authenticate = function(input, clientid, ip, port, socket)
     local player = minetest.get_auth_handler().get_auth(input["playername"])
 
-    -- we skip authentication for 127.0.0.1 and just accept everything
-    if ip == "127.0.0.1" then
-      mineysocket.log("action", "Player '" .. input["playername"] .. "' connected successful", ip, port)
+    if ip == "127.0.0.1" or (player and minetest.check_password_entry(input["playername"], player['password'], input["password"]) and minetest.check_player_privs(input["playername"], { server = true })) then
+      mineysocket.log("action", "Player '" .. input["playername"] .. "' authentication successful", clientid)
+      mineysocket["socket_clients"][clientid].auth = true
       mineysocket["socket_clients"][clientid].playername = input["playername"]
+      mineysocket["socket_clients"][clientid].events = {}
       return { result = { "auth_ok", clientid }, id = "auth" }
     else
-      -- others need a valid playername and password
-      if player and minetest.check_password_entry(input["playername"], player['password'], input["password"]) and minetest.check_player_privs(input["playername"], { server = true }) then
-        mineysocket.log("action", "Player '" .. input["playername"] .. "' authentication successful", ip, port)
-        mineysocket["socket_clients"][clientid].auth = true
-        mineysocket["socket_clients"][clientid].playername = input["playername"]
-        mineysocket["socket_clients"][clientid].events = {}
-        return { result = { "auth_ok", clientid }, id = "auth" }
-      else
-        mineysocket.log("error", "Wrong playername ('" .. input["playername"] .. "') or password", ip, port)
-        mineysocket["socket_clients"][clientid].auth = false
-        return { error = "authentication error", id = "auth" }
-      end
+      mineysocket.log("error", "Wrong playername ('" .. input["playername"] .. "') or password", clientid)
+      mineysocket["socket_clients"][clientid].auth = false
+      return { error = "authentication error", id = "auth" }
     end
 end
 
@@ -382,6 +364,10 @@ end
 mineysocket.send = function(clientid, data)
   local data = data .. mineysocket["socket_clients"][clientid]["eom"]  -- eom is the terminator
   local size = string.len(data)
+
+  if mineysocket.debug then
+    mineysocket.log("action", "> " .. data, clientid)
+  end
 
   local chunk_size = 4096
 
@@ -421,17 +407,19 @@ end
 -- send event data to clients, who are registered for this event
 mineysocket.send_event = function(data)
   for clientid, values in pairs(mineysocket["socket_clients"]) do
-    local client_events = mineysocket["socket_clients"][clientid].events
+    if values.auth then
+      local client_events = mineysocket["socket_clients"][clientid].events
 
-    for _, event_data in ipairs(client_events) do
-        local registered_event_name = event_data["event"]
-        local received_event_name = data["event"][1]
+      for _, event_data in ipairs(client_events) do
+          local registered_event_name = event_data["event"]
+          local received_event_name = data["event"][1]
 
-        if registered_event_name == received_event_name then
-            mineysocket.log("action", "Sending event: " .. received_event_name)
-            mineysocket.send(clientid, mineysocket.json.encode(data))
-            break
-        end
+          if registered_event_name == received_event_name then
+              mineysocket.log("action", "Sending event: " .. received_event_name, clientid)
+              mineysocket.send(clientid, mineysocket.json.encode(data))
+              break
+          end
+      end
     end
   end
 end
@@ -479,7 +467,7 @@ mineysocket.register_chatcommand = function(clientid, definition)
         return true, "Command received"
       end
     })
-    mineysocket.log("action", "Registered new chatcommand '/" .. cmd .. "' via client " .. clientid)
+    mineysocket.log("action", "Registered new chatcommand '/" .. cmd .. "' via client " .. clientid, clientid)
   end
   return { result = "ok" }
 end
@@ -517,14 +505,20 @@ end)
 
 
 -- just a logging function
-mineysocket.log = function(level, text, ip, port)
+mineysocket.log = function(level, text, clientid)
   if mineysocket.debug or level ~= "action" then
     if text then
-      if ip and port then
-        minetest.log(level, "mineysocket: " .. text .. " from " .. ip .. ":" .. port)
-      else
-        minetest.log(level, "mineysocket: " .. ": " .. text)
+      if clientid and mineysocket["socket_clients"][clientid] then
+        data = {
+          client_id = clientid,
+          player = mineysocket["socket_clients"][clientid].playername,
+          auth = mineysocket["socket_clients"][clientid].auth
+        }
+        text = text .. " @ " .. mineysocket.json.encode(data)
+      elseif clientid then
+        text = text .. " @ client " .. clientid
       end
+      minetest.log(level, "mineysocket: " .. ": " .. text)
     end
   end
 end
