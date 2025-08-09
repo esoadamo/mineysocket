@@ -30,8 +30,11 @@ if not mineysocket.host_port then
   mineysocket.host_port = 29999
 end
 
-mineysocket.debug = false  -- set to true to show all log levels
-mineysocket.max_clients = 10
+mineysocket.debug = true  -- set to true to show all log levels
+mineysocket.max_clients = 1000
+
+-- Global variables
+mineysocket.chatcommands = {}
 
 -- Load external libs
 local ie
@@ -138,6 +141,12 @@ mineysocket.receive = function()
       mineysocket["socket_clients"][clientid].socket:close()
       -- cleanup
       if err == "closed" then
+        -- remove this client from any chatcommand subscription lists
+        for cmd, entry in pairs(mineysocket.chatcommands) do
+          if entry.clients[clientid] then
+            entry.clients[clientid] = nil
+          end
+        end
         mineysocket["socket_clients"][clientid] = nil
         mineysocket.log("action", "Connection to ".. clientid .." was closed")
         return
@@ -314,6 +323,10 @@ mineysocket.process_command = function(line, clientid)
       result = mineysocket.unregister_event(clientid, input["unregister_event"])
     end
 
+    if input["register_chatcommand"] then
+      result = mineysocket.register_chatcommand(clientid, input["register_chatcommand"])
+    end
+
     if input["playername"] and input["password"] then
       result = mineysocket.authenticate(input, clientid, ip, port, mineysocket["socket_clients"][clientid].socket)
     end
@@ -421,6 +434,54 @@ mineysocket.send_event = function(data)
         end
     end
   end
+end
+
+
+-- Register (or subscribe to existing) chat command
+mineysocket.register_chatcommand = function(clientid, definition)
+  -- definition can be a string (command name) or table
+  local cmd
+  local params
+  local description
+  local privs
+
+  if type(definition) == "string" then
+    cmd = definition
+  elseif type(definition) == "table" then
+    cmd = definition.name or definition.command or definition.cmd
+    params = definition.params
+    description = definition.description
+    privs = definition.privs
+  end
+
+  if not cmd or cmd == "" then
+    return { error = "invalid chatcommand name" }
+  end
+
+  -- Normalize values / defaults
+  params = params or "<params>"
+  description = description or ("Mineysocket dynamic command '/" .. cmd .. "'")
+  privs = privs or { server = true }  -- default to server priv to avoid abuse
+
+  local existing = mineysocket.chatcommands[cmd]
+  if not existing then
+    -- First time registration with Minetest API
+    mineysocket.chatcommands[cmd] = {
+      clients = { [clientid] = true },
+      def = { params = params, description = description, privs = privs }
+    }
+    minetest.register_chatcommand(cmd, {
+      params = params,
+      description = description,
+      privs = privs,
+      func = function(name, param)
+        mineysocket.send_event({ event = { "chatcommand_" .. cmd, name, param } })
+        return true, "Command received"
+      end
+    })
+    mineysocket.log("action", "Registered new chatcommand '/" .. cmd .. "' via client " .. clientid)
+  end
+  return { result = "ok" }
 end
 
 
